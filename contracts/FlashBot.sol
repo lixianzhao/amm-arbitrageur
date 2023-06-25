@@ -11,12 +11,12 @@ import 'hardhat/console.sol';
 import './interfaces/IUniswapV2Pair.sol';
 import './interfaces/IWETH.sol';
 import './libraries/Decimal.sol';
-
+// b1 的 价格 <  b2 的 价格
 struct OrderedReserves {
     uint256 a1; // base asset
-    uint256 b1;
-    uint256 a2;
-    uint256 b2;
+    uint256 b1; // quote asset
+    uint256 a2; // base asset
+    uint256 b2; // quote asset
 }
 
 struct ArbitrageInfo {
@@ -67,7 +67,10 @@ contract FlashBot is Ownable {
     /// @dev Redirect uniswap callback function
     /// The callback function on different DEX are not same, so use a fallback to redirect to uniswapV2Call
     fallback(bytes calldata _input) external returns (bytes memory) {
-        (address sender, uint256 amount0, uint256 amount1, bytes memory data) = abi.decode(_input[4:], (address, uint256, uint256, bytes));
+        (address sender, uint256 amount0, uint256 amount1, bytes memory data) = abi.decode(
+            _input[4:],
+            (address, uint256, uint256, bytes)
+        );
         uniswapV2Call(sender, amount0, amount1, data);
     }
 
@@ -115,22 +118,21 @@ contract FlashBot is Ownable {
         return baseTokens.contains(token);
     }
 
-    function isbaseTokenSmaller(address pool0, address pool1)
-        internal
-        view
-        returns (
-            bool baseSmaller,
-            address baseToken,
-            address quoteToken
-        )
-    {
+    function isbaseTokenSmaller(
+        address pool0,
+        address pool1
+    ) internal view returns (bool baseSmaller, address baseToken, address quoteToken) {
         require(pool0 != pool1, 'Same pair address');
         (address pool0Token0, address pool0Token1) = (IUniswapV2Pair(pool0).token0(), IUniswapV2Pair(pool0).token1());
         (address pool1Token0, address pool1Token1) = (IUniswapV2Pair(pool1).token0(), IUniswapV2Pair(pool1).token1());
+        // 判断大小
         require(pool0Token0 < pool0Token1 && pool1Token0 < pool1Token1, 'Non standard uniswap AMM pair');
+        // 判断两个pair是由相对的token组成
         require(pool0Token0 == pool1Token0 && pool0Token1 == pool1Token1, 'Require same token pair');
+        // pair中必须包含baseToken
         require(baseTokensContains(pool0Token0) || baseTokensContains(pool0Token1), 'No base token in pair');
 
+        // 返回pair的baseToken和quoteToken,  并判断token0 是不是baseToken
         (baseSmaller, baseToken, quoteToken) = baseTokensContains(pool0Token0)
             ? (true, pool0Token0, pool0Token1)
             : (false, pool0Token1, pool0Token0);
@@ -138,31 +140,25 @@ contract FlashBot is Ownable {
 
     /// @dev Compare price denominated in quote token between two pools
     /// We borrow base token by using flash swap from lower price pool and sell them to higher price pool
+    // 按照搬的顺序返回reserve（从quote 低的 搬到 高的）
     function getOrderedReserves(
         address pool0,
         address pool1,
         bool baseTokenSmaller
-    )
-        internal
-        view
-        returns (
-            address lowerPool,
-            address higherPool,
-            OrderedReserves memory orderedReserves
-        )
-    {
+    ) internal view returns (address lowerPool, address higherPool, OrderedReserves memory orderedReserves) {
         (uint256 pool0Reserve0, uint256 pool0Reserve1, ) = IUniswapV2Pair(pool0).getReserves();
         (uint256 pool1Reserve0, uint256 pool1Reserve1, ) = IUniswapV2Pair(pool1).getReserves();
 
         // Calculate the price denominated in quote asset token
-        (Decimal.D256 memory price0, Decimal.D256 memory price1) =
-            baseTokenSmaller
-                ? (Decimal.from(pool0Reserve0).div(pool0Reserve1), Decimal.from(pool1Reserve0).div(pool1Reserve1))
-                : (Decimal.from(pool0Reserve1).div(pool0Reserve0), Decimal.from(pool1Reserve1).div(pool1Reserve0));
+        // 计算每个交易对的quoteToken的价格，以baseToken来计价
+        (Decimal.D256 memory price0, Decimal.D256 memory price1) = baseTokenSmaller
+            ? (Decimal.from(pool0Reserve0).div(pool0Reserve1), Decimal.from(pool1Reserve0).div(pool1Reserve1))
+            : (Decimal.from(pool0Reserve1).div(pool0Reserve0), Decimal.from(pool1Reserve1).div(pool1Reserve0));
 
         // get a1, b1, a2, b2 with following rule:
         // 1. (a1, b1) represents the pool with lower price, denominated in quote asset token
         // 2. (a1, a2) are the base tokens in two pools
+        // qouteToken： 从价格低的pool 搬到 价格高的pool
         if (price0.lessThan(price1)) {
             (lowerPool, higherPool) = (pool0, pool1);
             (orderedReserves.a1, orderedReserves.b1, orderedReserves.a2, orderedReserves.b2) = baseTokenSmaller
@@ -189,14 +185,15 @@ contract FlashBot is Ownable {
 
         // this must be updated every transaction for callback origin authentication
         permissionedPairAddress = info.lowerPool;
-
+        // baseToken 输入套利币 存在合约中
         uint256 balanceBefore = IERC20(info.baseToken).balanceOf(address(this));
 
         // avoid stack too deep error
         {
             uint256 borrowAmount = calcBorrowAmount(orderedReserves);
-            (uint256 amount0Out, uint256 amount1Out) =
-                info.baseTokenSmaller ? (uint256(0), borrowAmount) : (borrowAmount, uint256(0));
+            (uint256 amount0Out, uint256 amount1Out) = info.baseTokenSmaller
+                ? (uint256(0), borrowAmount)
+                : (borrowAmount, uint256(0));
             // borrow quote token on lower price pool, calculate how much debt we need to pay demoninated in base token
             uint256 debtAmount = getAmountIn(borrowAmount, orderedReserves.a1, orderedReserves.b1);
             // sell borrowed quote token on higher price pool, calculate how much base token we can get
@@ -227,13 +224,9 @@ contract FlashBot is Ownable {
         permissionedPairAddress = address(1);
     }
 
-    function uniswapV2Call(
-        address sender,
-        uint256 amount0,
-        uint256 amount1,
-        bytes memory data
-    ) public {
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes memory data) public {
         // access control
+        // 权限控制（只允许发生借贷的Pair执行这个回调）
         require(msg.sender == permissionedPairAddress, 'Non permissioned address call');
         require(sender == address(this), 'Not from this contract');
 
@@ -242,24 +235,32 @@ contract FlashBot is Ownable {
 
         IERC20(info.borrowedToken).safeTransfer(info.targetPool, borrowedAmount);
 
-        (uint256 amount0Out, uint256 amount1Out) =
-            info.debtTokenSmaller ? (info.debtTokenOutAmount, uint256(0)) : (uint256(0), info.debtTokenOutAmount);
+        (uint256 amount0Out, uint256 amount1Out) = info.debtTokenSmaller
+            ? (info.debtTokenOutAmount, uint256(0))
+            : (uint256(0), info.debtTokenOutAmount);
         IUniswapV2Pair(info.targetPool).swap(amount0Out, amount1Out, address(this), new bytes(0));
 
         IERC20(info.debtToken).safeTransfer(info.debtPool, info.debtAmount);
     }
 
     /// @notice Calculate how much profit we can by arbitraging between two pools
+    // 计算出两个交易对之间套利的最大利润（以 Base Tokne计价）
     function getProfit(address pool0, address pool1) external view returns (uint256 profit, address baseToken) {
+        // 并判断token0 是不是baseToken
         (bool baseTokenSmaller, , ) = isbaseTokenSmaller(pool0, pool1);
+        // 获取baseToken
         baseToken = baseTokenSmaller ? IUniswapV2Pair(pool0).token0() : IUniswapV2Pair(pool0).token1();
 
+        // 确定返回池子的顺序（按照quote的价格从低到高排）
         (, , OrderedReserves memory orderedReserves) = getOrderedReserves(pool0, pool1, baseTokenSmaller);
 
+        // 计算出最佳的quoteToken的数量
         uint256 borrowAmount = calcBorrowAmount(orderedReserves);
         // borrow quote token on lower price pool,
+        // 从quoteToken价格低的池子里，算出来需要借多少baseToken
         uint256 debtAmount = getAmountIn(borrowAmount, orderedReserves.a1, orderedReserves.b1);
         // sell borrowed quote token on higher price pool
+        // 从quoteToken价格高的的池子里，看看能换出来多少baseToken
         uint256 baseTokenOutAmount = getAmountOut(borrowAmount, orderedReserves.b2, orderedReserves.a2);
         if (baseTokenOutAmount < debtAmount) {
             profit = 0;
@@ -269,6 +270,7 @@ contract FlashBot is Ownable {
     }
 
     /// @dev calculate the maximum base asset amount to borrow in order to get maximum profit during arbitrage
+    // 根据公式计算 https://github.com/paco0x/amm-arbitrageur/blob/master/README-cn.md
     function calcBorrowAmount(OrderedReserves memory reserves) internal pure returns (uint256 amount) {
         // we can't use a1,b1,a2,b2 directly, because it will result overflow/underflow on the intermediate result
         // so we:
@@ -276,9 +278,10 @@ contract FlashBot is Ownable {
         //    2. calculate the result by using above numbers
         //    3. multiply d with the result to get the final result
         // Note: this workaround is only suitable for ERC20 token with 18 decimals, which I believe most tokens do
-
+        // a1 a2 是baseToken   b1 和 b2 是 quoteToken
         uint256 min1 = reserves.a1 < reserves.b1 ? reserves.a1 : reserves.b1;
         uint256 min2 = reserves.a2 < reserves.b2 ? reserves.a2 : reserves.b2;
+        // 获取 两个交易对中最小的一个reserve
         uint256 min = min1 < min2 ? min1 : min2;
 
         // choose appropriate number to divide based on the minimum number
@@ -307,8 +310,12 @@ contract FlashBot is Ownable {
             d = 1e10;
         }
 
-        (int256 a1, int256 a2, int256 b1, int256 b2) =
-            (int256(reserves.a1 / d), int256(reserves.a2 / d), int256(reserves.b1 / d), int256(reserves.b2 / d));
+        (int256 a1, int256 a2, int256 b1, int256 b2) = (
+            int256(reserves.a1 / d),
+            int256(reserves.a2 / d),
+            int256(reserves.b1 / d),
+            int256(reserves.b2 / d)
+        );
 
         int256 a = a1 * b1 - a2 * b2;
         int256 b = 2 * b1 * b2 * (a1 + a2);
@@ -322,12 +329,8 @@ contract FlashBot is Ownable {
     }
 
     /// @dev find solution of quadratic equation: ax^2 + bx + c = 0, only return the positive solution
-    function calcSolutionForQuadratic(
-        int256 a,
-        int256 b,
-        int256 c
-    ) internal pure returns (int256 x1, int256 x2) {
-        int256 m = b**2 - 4 * a * c;
+    function calcSolutionForQuadratic(int256 a, int256 b, int256 c) internal pure returns (int256 x1, int256 x2) {
+        int256 m = b ** 2 - 4 * a * c;
         // m < 0 leads to complex number
         require(m > 0, 'Complex number');
 
@@ -342,7 +345,7 @@ contract FlashBot is Ownable {
 
         // The scale factor is a crude way to turn everything into integer calcs.
         // Actually do (n * 10 ^ 4) ^ (1/2)
-        uint256 _n = n * 10**6;
+        uint256 _n = n * 10 ** 6;
         uint256 c = _n;
         res = _n;
 
@@ -355,7 +358,7 @@ contract FlashBot is Ownable {
             }
             res = xi;
         }
-        res = res / 10**3;
+        res = res / 10 ** 3;
     }
 
     // copy from UniswapV2Library
