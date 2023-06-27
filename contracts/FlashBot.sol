@@ -71,6 +71,7 @@ contract FlashBot is Ownable {
             _input[4:],
             (address, uint256, uint256, bytes)
         );
+        // sender === pairAddress（发生借贷的那个pair）
         uniswapV2Call(sender, amount0, amount1, data);
     }
 
@@ -118,6 +119,14 @@ contract FlashBot is Ownable {
         return baseTokens.contains(token);
     }
 
+    /**
+     *
+     * @param pool0
+     * @param pool1
+     * @return baseSmaller 并判断token0 是不是baseToken
+     * @return baseToken   返回pair的baseToken
+     * @return quoteToken  返回pair的quoteToken
+     */
     function isbaseTokenSmaller(
         address pool0,
         address pool1
@@ -127,7 +136,7 @@ contract FlashBot is Ownable {
         (address pool1Token0, address pool1Token1) = (IUniswapV2Pair(pool1).token0(), IUniswapV2Pair(pool1).token1());
         // 判断大小
         require(pool0Token0 < pool0Token1 && pool1Token0 < pool1Token1, 'Non standard uniswap AMM pair');
-        // 判断两个pair是由相对的token组成
+        // 判断两个pair是由相同的token组成
         require(pool0Token0 == pool1Token0 && pool0Token1 == pool1Token1, 'Require same token pair');
         // pair中必须包含baseToken
         require(baseTokensContains(pool0Token0) || baseTokensContains(pool0Token1), 'No base token in pair');
@@ -140,7 +149,15 @@ contract FlashBot is Ownable {
 
     /// @dev Compare price denominated in quote token between two pools
     /// We borrow base token by using flash swap from lower price pool and sell them to higher price pool
-    // 按照搬的顺序返回reserve（从quote 低的 搬到 高的）
+    /**
+     * 按照搬的顺序返回reserve（从quote 低的 搬到 高的）
+     * @param pool0
+     * @param pool1
+     * @param baseTokenSmaller
+     * @return lowerPool    quoteToken 价格低的池子
+     * @return higherPool   quoteToken 价格高的池子
+     * @return orderedReserves 按照池子的从低到高排列（内部是baseToken在前）
+     */
     function getOrderedReserves(
         address pool0,
         address pool1,
@@ -150,7 +167,7 @@ contract FlashBot is Ownable {
         (uint256 pool1Reserve0, uint256 pool1Reserve1, ) = IUniswapV2Pair(pool1).getReserves();
 
         // Calculate the price denominated in quote asset token
-        // 计算每个交易对的quoteToken的价格，以baseToken来计价
+        // 计算每个交易对中quoteToken的单价，以baseToken来计价  baseToken/quoteToken
         (Decimal.D256 memory price0, Decimal.D256 memory price1) = baseTokenSmaller
             ? (Decimal.from(pool0Reserve0).div(pool0Reserve1), Decimal.from(pool1Reserve0).div(pool1Reserve1))
             : (Decimal.from(pool0Reserve1).div(pool0Reserve0), Decimal.from(pool1Reserve1).div(pool1Reserve0));
@@ -158,7 +175,8 @@ contract FlashBot is Ownable {
         // get a1, b1, a2, b2 with following rule:
         // 1. (a1, b1) represents the pool with lower price, denominated in quote asset token
         // 2. (a1, a2) are the base tokens in two pools
-        // qouteToken： 从价格低的pool 搬到 价格高的pool
+
+        // qouteToken单价比价： 从价格低的pool 搬到 价格高的pool
         if (price0.lessThan(price1)) {
             (lowerPool, higherPool) = (pool0, pool1);
             (orderedReserves.a1, orderedReserves.b1, orderedReserves.a2, orderedReserves.b2) = baseTokenSmaller
@@ -184,34 +202,39 @@ contract FlashBot is Ownable {
         (info.lowerPool, info.higherPool, orderedReserves) = getOrderedReserves(pool0, pool1, info.baseTokenSmaller);
 
         // this must be updated every transaction for callback origin authentication
+        // 权限控制，调用的fallback的是必须是lowerPool
         permissionedPairAddress = info.lowerPool;
-        // baseToken 输入套利币 存在合约中
+        // baseToken 存在合约中
         uint256 balanceBefore = IERC20(info.baseToken).balanceOf(address(this));
 
         // avoid stack too deep error
         {
+            // 借出来的quoteToken
             uint256 borrowAmount = calcBorrowAmount(orderedReserves);
             (uint256 amount0Out, uint256 amount1Out) = info.baseTokenSmaller
                 ? (uint256(0), borrowAmount)
                 : (borrowAmount, uint256(0));
             // borrow quote token on lower price pool, calculate how much debt we need to pay demoninated in base token
+            // 欠的钱 baseToken
             uint256 debtAmount = getAmountIn(borrowAmount, orderedReserves.a1, orderedReserves.b1);
             // sell borrowed quote token on higher price pool, calculate how much base token we can get
+            // 在quoteToken价格高的池子 换取的baseToken
             uint256 baseTokenOutAmount = getAmountOut(borrowAmount, orderedReserves.b2, orderedReserves.a2);
             require(baseTokenOutAmount > debtAmount, 'Arbitrage fail, no profit');
             console.log('Profit:', (baseTokenOutAmount - debtAmount) / 1 ether);
 
             // can only initialize this way to avoid stack too deep error
             CallbackData memory callbackData;
-            callbackData.debtPool = info.lowerPool;
-            callbackData.targetPool = info.higherPool;
+            callbackData.debtPool = info.lowerPool; //quoteToken价格低的pool
+            callbackData.targetPool = info.higherPool; //quoteToken价格高的pool
             callbackData.debtTokenSmaller = info.baseTokenSmaller;
-            callbackData.borrowedToken = info.quoteToken;
-            callbackData.debtToken = info.baseToken;
-            callbackData.debtAmount = debtAmount;
-            callbackData.debtTokenOutAmount = baseTokenOutAmount;
+            callbackData.borrowedToken = info.quoteToken; // 从lowerPool借出来的
+            callbackData.debtToken = info.baseToken; // 欠的baseToken，需要还给lowerPool的
+            callbackData.debtAmount = debtAmount; // 欠的baseToken，需要还给lowerPool的
+            callbackData.debtTokenOutAmount = baseTokenOutAmount; // 收到的毛利
 
             bytes memory data = abi.encode(callbackData);
+            // 借出来quoteToken 到当前合约
             IUniswapV2Pair(info.lowerPool).swap(amount0Out, amount1Out, address(this), data);
         }
 
@@ -226,13 +249,14 @@ contract FlashBot is Ownable {
 
     function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes memory data) public {
         // access control
-        // 权限控制（只允许发生借贷的Pair执行这个回调）
+        // 权限控制（只允许lowerPool执行这个回调）
         require(msg.sender == permissionedPairAddress, 'Non permissioned address call');
         require(sender == address(this), 'Not from this contract');
 
         uint256 borrowedAmount = amount0 > 0 ? amount0 : amount1;
         CallbackData memory info = abi.decode(data, (CallbackData));
 
+        // 下面就是正常的swap 和 还钱的操作
         IERC20(info.borrowedToken).safeTransfer(info.targetPool, borrowedAmount);
 
         (uint256 amount0Out, uint256 amount1Out) = info.debtTokenSmaller
@@ -244,7 +268,14 @@ contract FlashBot is Ownable {
     }
 
     /// @notice Calculate how much profit we can by arbitraging between two pools
-    // 计算出两个交易对之间套利的最大利润（以 Base Tokne计价）
+    /**
+     * 计算出两个交易对之间套利的最大利润（以 Base Tokne计价）
+     * 链上计算是否存在利润
+     * @param pool0
+     * @param pool1
+     * @return profit
+     * @return baseToken
+     */
     function getProfit(address pool0, address pool1) external view returns (uint256 profit, address baseToken) {
         // 并判断token0 是不是baseToken
         (bool baseTokenSmaller, , ) = isbaseTokenSmaller(pool0, pool1);
@@ -254,14 +285,17 @@ contract FlashBot is Ownable {
         // 确定返回池子的顺序（按照quote的价格从低到高排）
         (, , OrderedReserves memory orderedReserves) = getOrderedReserves(pool0, pool1, baseTokenSmaller);
 
-        // 计算出最佳的quoteToken的数量
+        // 计算出最佳的quoteToken的数量（也就是从价格低的池子搬多少quoteToken到价格高的池子）
+        // 借了 borrowAmount 的 quoteToken
         uint256 borrowAmount = calcBorrowAmount(orderedReserves);
         // borrow quote token on lower price pool,
         // 从quoteToken价格低的池子里，算出来需要借多少baseToken
+        // 欠了 debtAmount 的 baseToken 这也是最后要还的
         uint256 debtAmount = getAmountIn(borrowAmount, orderedReserves.a1, orderedReserves.b1);
         // sell borrowed quote token on higher price pool
         // 从quoteToken价格高的的池子里，看看能换出来多少baseToken
         uint256 baseTokenOutAmount = getAmountOut(borrowAmount, orderedReserves.b2, orderedReserves.a2);
+        // 最终换出来的 base < 欠的 则收益为0
         if (baseTokenOutAmount < debtAmount) {
             profit = 0;
         } else {
